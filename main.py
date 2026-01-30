@@ -1,44 +1,39 @@
-
 import os
-from dotenv import load_dotenv
-load_dotenv()
-
-import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import openai
-
-
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
 
 app = FastAPI()
 
-# Load your Azure API key from Railway environment
+# Load Azure API key from environment (Railway Variables)
 AZURE_KEY = os.getenv("AZURE_OPENAI_KEY")
 if not AZURE_KEY:
     raise ValueError("AZURE_OPENAI_KEY is not set!")
 
-# Configure Azure OpenAI
+# Azure OpenAI config
 openai.api_type = "azure"
 openai.api_base = "https://impactguru-openai.openai.azure.com/"
 openai.api_version = "2025-01-01-preview"
 openai.api_key = AZURE_KEY
 
-DEPLOYMENT_NAME = "gpt-4o"  # This must match your Azure deployment exactly
+DEPLOYMENT_NAME = "gpt-4o"  # Must match your Azure deployment name exactly
+
+class PromptRequest(BaseModel):
+    prompt: str
 
 @app.post("/custom-llm")
-async def custom_llm(payload: dict):
-    prompt = payload.get("prompt", "")
-    if not prompt:
-        return {"output": "No prompt provided."}
-    
+async def custom_llm(req: PromptRequest):
+    if not req.prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required")
+
     try:
         response = openai.ChatCompletion.create(
-            engine=DEPLOYMENT_NAME,  # Azure deployment name
-            messages=[{"role": "user", "content": prompt}]
+            engine=DEPLOYMENT_NAME,  # Azure deployment
+            messages=[{"role": "user", "content": req.prompt}]
         )
         return {"output": response.choices[0].message.content}
     except Exception as e:
-        return {"output": f"Error calling Azure OpenAI: {e}"}
+        raise HTTPException(status_code=500, detail=f"Azure OpenAI call failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn
