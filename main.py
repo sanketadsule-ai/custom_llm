@@ -19,18 +19,19 @@ DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
 app = FastAPI()
 
-# -------------------
-# Updated Models for Tool Support
+
 # -------------------
 class Message(BaseModel):
     role: str
     content: Optional[str] = None
-    tool_calls: Optional[List[Any]] = None # Allow receiving tool calls in history
+    tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None  # <--- ADD THIS
+    name: Optional[str] = None         # <--- ADD THIS (for tool role)
 
 class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: List[Message]
-    tools: Optional[List[Any]] = None      # ElevenLabs sends tools here
+    tools: Optional[List[Any]] = None
     stream: Optional[bool] = True
 
 @app.get("/")
