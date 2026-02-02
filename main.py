@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from openai import AzureOpenAI
+from fastapi.responses import JSONResponse
 
 # -------------------
 # Azure OpenAI Client
@@ -53,22 +54,23 @@ async def chat_completions(req: ChatRequest):
 
         assistant_text = response.choices[0].message.content or ""
 
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": DEPLOYMENT,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": assistant_text
-                    },
-                    "finish_reason": "stop"
-                }
-            ]
-        }
+        return JSONResponse(
+    status_code=200,
+    content={
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": DEPLOYMENT,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": assistant_text
+            },
+            "finish_reason": "stop"
+        }]
+    }
+)
 
     except Exception as e:
         print("🔥 ERROR:", str(e))
