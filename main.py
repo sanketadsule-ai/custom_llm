@@ -46,11 +46,14 @@ def health():
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest):
     try:
+        
         response = client.chat.completions.create(
-            model=DEPLOYMENT,
-            messages=[m.model_dump() for m in req.messages],
-            temperature=0.7,
-        )
+    model=DEPLOYMENT,
+    messages=[m.model_dump() for m in req.messages],
+    temperature=0.2,
+    max_tokens=40,
+    timeout=2.0,   # IMPORTANT
+)
 
         assistant_text = response.choices[0].message.content or ""
 
