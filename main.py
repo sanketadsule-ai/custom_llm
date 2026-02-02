@@ -1,4 +1,5 @@
 import os
+import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -50,15 +51,19 @@ async def chat_completions(req: ChatRequest):
             temperature=0.7,
         )
 
+        assistant_text = response.choices[0].message.content or ""
+
         return {
-            "id": "chatcmpl-elevenlabs",
+            "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
+            "created": int(time.time()),
+            "model": DEPLOYMENT,
             "choices": [
                 {
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": response.choices[0].message.content
+                        "content": assistant_text
                     },
                     "finish_reason": "stop"
                 }
