@@ -1,9 +1,9 @@
-
 import os
 import hashlib
 import logging
 import asyncio
 import orjson
+import httpx
 from typing import List, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -17,11 +17,17 @@ from cachetools import LRUCache
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maya-ultra-low-latency")
 
+# PERFORMANCE: Use a shared HTTPX client for connection pooling
+# This shaves off significant latency by reusing TCP/SSL connections.
+limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+http_client = httpx.AsyncClient(limits=limits, timeout=60.0)
+
 # API Version 2024-08-01-preview is the most stable for GPT-4o in 2026
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version="2024-08-01-preview", 
+    api_version="2024-08-01-preview",
+    http_client=http_client  # Injecting the pooled client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
@@ -60,8 +66,10 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     async def event_generator():
         # FAST CACHE: Check for exact repeat user context
+        # USER-SPECIFIC FIX: Include 'x-user-id' in the hash to prevent cross-user cache hits
+        user_id = request.headers.get("x-user-id", "anonymous")
         user_context = "".join([m.content for m in req.messages if m.role == "user"][-10:])
-        ckey = hashlib.md5(user_context.encode()).hexdigest()
+        ckey = hashlib.md5(f"{user_id}:{user_context}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
             yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
@@ -127,6 +135,10 @@ async def chat_completions(req: ChatRequest, request: Request):
             "Connection": "keep-alive"
         }
     )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
 
 if __name__ == "__main__":
     import uvicorn
