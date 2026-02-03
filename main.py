@@ -1,9 +1,9 @@
+
 import os
 import hashlib
 import logging
 import asyncio
 import orjson
-import httpx
 from typing import List, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -11,116 +11,136 @@ from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
 from cachetools import LRUCache
 
-# 1. Setup
+# -----------------------------
+# 1. High-Performance Setup
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("maya-ultra")
+logger = logging.getLogger("maya-ultra-low-latency")
 
-http_client = httpx.AsyncClient(
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-    timeout=60.0
-)
-
+# API Version 2024-08-01-preview is the most stable for GPT-4o in 2026
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version="2024-08-01-preview", 
-    http_client=http_client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 
-# We use two caches: one for text, one for tracking tool execution status
-RESPONSE_CACHE = LRUCache(maxsize=500)
-TOOL_EXECUTION_TRACKER = LRUCache(maxsize=500) # Track: ckey -> bool
+# LRU Cache for 0ms repeat response latency
+RESPONSE_CACHE = LRUCache(maxsize=200)
 
 app = FastAPI()
 
+# -----------------------------
+# 2. Optimized Models
+# -----------------------------
+class Message(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    role: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
 class ChatRequest(BaseModel):
-    messages: List[Any]
+    messages: List[Message]
     tools: Optional[List[Any]] = None
     stream: bool = True
     max_tokens: int = 150
 
-async def execute_tool_background(tool_list: List[dict], ckey: str):
-    """Execution with a Global Lock check."""
-    # DOUBLE CHECK: If another worker/thread already finished this ckey, abort.
-    if TOOL_EXECUTION_TRACKER.get(ckey) == "EXECUTED":
-        return
-
-    TOOL_EXECUTION_TRACKER[ckey] = "EXECUTED"
-    for tool in tool_list:
-        logger.info(f"⚡ [SINGLE EXEC] {tool.get('name')} | Turn: {ckey[:8]}")
-        # Your n8n/webhook logic here
-
+# -----------------------------
+# 3. Optimized Logic
+# -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
+    # Security check
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
-    # Generate a unique key for THIS turn (User ID + Last Msg Content)
-    user_id = request.headers.get("x-user-id", "anon")
-    last_msg = str(req.messages[-1])
-    ckey = hashlib.md5(f"{user_id}:{last_msg}".encode()).hexdigest()
-
     async def event_generator():
-        # Local lock for this specific stream instance
-        stream_instance_fired = False 
-        tool_buffer = {}
-        collected_text = []
+        # FAST CACHE: Check for exact repeat user context
+        user_context = "".join([m.content for m in req.messages if m.role == "user"][-10:])
+        ckey = hashlib.md5(user_context.encode()).hexdigest()
+        
+        if ckey in RESPONSE_CACHE:
+            yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
+            yield b"data: [DONE]\n\n"
+            return
 
+        collected = []
         try:
+            # GPT-4O OPTIMIZATION: 
+            # 1. Reduced message window to 10 for better speed.
+            # 2. Removed 'extra_body' to fix the 400 Bad Request error.
             kwargs = {
                 "model": DEPLOYMENT,
-                "messages": [m if isinstance(m, dict) else m.model_dump(exclude_none=True) for m in req.messages[-10:]],
+                "messages": [m.model_dump(exclude_none=True) for m in req.messages[-10:]],
                 "temperature": 0.0,
                 "stream": True,
                 "max_tokens": req.max_tokens,
                 "stream_options": {"include_usage": True},
-                "parallel_tool_calls": False
             }
             if req.tools:
                 kwargs["tools"] = req.tools
+                kwargs["tool_choice"] = "auto"
 
-            response = await client.chat.completions.create(**kwargs)
+            # 10s timeout: GPT-4o is fast; if it takes longer, something is wrong.
+            response = await asyncio.wait_for(
+                client.chat.completions.create(**kwargs),
+                timeout=10.0 
+            )
 
+            first_chunk = True
             async for chunk in response:
-                if not chunk.choices: continue
-                delta = chunk.choices[0].delta
-                finish_reason = chunk.choices[0].finish_reason
+                # Direct serialization to bytes for lower overhead
+                chunk_data = chunk.model_dump(exclude_none=True)
+                yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
 
-                # 1. Reconstruct Tool JSON
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_buffer:
-                            tool_buffer[idx] = {"name": "", "args": ""}
-                        if tc.function.name: tool_buffer[idx]["name"] += tc.function.name
-                        if tc.function.arguments: tool_buffer[idx]["args"] += tc.function.arguments
+                # Extract content for local cache
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        collected.append(delta.content)
 
-                # 2. TRIGGER WITH TRIPLE LOCK
-                # Check 1: Finish reason hit?
-                # Check 2: Has this specific stream fired yet?
-                # Check 3: Has this conversation turn (ckey) been marked as executed in global cache?
-                if finish_reason == "tool_calls" and not stream_instance_fired:
-                    if ckey not in TOOL_EXECUTION_TRACKER:
-                        if tool_buffer:
-                            asyncio.create_task(execute_tool_background(list(tool_buffer.values()), ckey))
-                            stream_instance_fired = True
+                # TURBO-FLUSH: Force transmission on the very first token
+                if first_chunk:
+                    first_chunk = False
+                    await asyncio.sleep(0) # Micro-pause to flush TCP buffer
 
-                if delta.content:
-                    collected_text.append(delta.content)
-                    yield b"data: " + orjson.dumps(chunk.model_dump(exclude_none=True)) + b"\n\n"
+            # Update cache in the background
+            if collected:
+                RESPONSE_CACHE[ckey] = "".join(collected)
 
             yield b"data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"Streaming Error: {e}")
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no", # Critical for Real-time
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    # Set workers to 1 to ensure the TOOL_EXECUTION_TRACKER (memory) is shared
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1, access_log=False)
+    import sys
+
+    # Adaptive loop selection (prevents Windows errors, uses uvloop on Railway)
+    loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
+
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
+        loop=loop_type,
+        http="httptools",
+        workers=1,
+        access_log=False
+    )
