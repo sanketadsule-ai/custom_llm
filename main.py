@@ -53,13 +53,12 @@ class ChatRequest(BaseModel):
 async def execute_tool_silently(full_tool_calls: List[dict]):
     """
     Executes the completed tool JSON in the background.
-    Maya is already speaking while this runs.
     """
     for tc in full_tool_calls:
         name = tc.get("name")
         args = tc.get("args")
-        # LOGGING ONLY - Replace with your actual n8n/webhook call
-        logger.info(f"⚡ Executing Tool: {name} | Args: {args}")
+        # Replace this log with your actual n8n/webhook call
+        logger.info(f"⚡ [SINGLE EXEC] Tool: {name} | Args: {args}")
 
 # -----------------------------
 # 4. Optimized Event Generator
@@ -70,11 +69,11 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # CACHE KEY: ID + Text + Index (Prevents Loops)
+        # CACHE KEY: ID + Text + Index
         msg_history = req.messages
         msg_count = len(msg_history)
         user_id = request.headers.get("x-user-id", "default_donor") 
-        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-1:])
+        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-5:])
         ckey = hashlib.md5(f"{user_id}:{last_user_msg}:{msg_count}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
@@ -84,7 +83,8 @@ async def chat_completions(req: ChatRequest, request: Request):
             return
 
         collected_content = []
-        tool_accumulator = {} # Buffers fragments
+        tool_accumulator = {}
+        tool_executed = False  # THE GUARD: Prevents duplicate firing
 
         try:
             kwargs = {
@@ -105,7 +105,7 @@ async def chat_completions(req: ChatRequest, request: Request):
                 delta = chunk.choices[0].delta
                 finish_reason = chunk.choices[0].finish_reason
 
-                # STEP A: Accumulate Tool Fragments
+                # A. Accumulate Fragments
                 if delta.tool_calls:
                     for tc_chunk in delta.tool_calls:
                         idx = tc_chunk.index
@@ -116,11 +116,13 @@ async def chat_completions(req: ChatRequest, request: Request):
                         if tc_chunk.function.arguments:
                             tool_accumulator[idx]["args"] += tc_chunk.function.arguments
 
-                # STEP B: Trigger Background Execution on Completion
-                if finish_reason == "tool_calls":
-                    asyncio.create_task(execute_tool_silently(list(tool_accumulator.values())))
+                # B. One-Shot Trigger (The Fix for Redundant Calls)
+                if finish_reason == "tool_calls" and not tool_executed:
+                    if tool_accumulator:
+                        asyncio.create_task(execute_tool_silently(list(tool_accumulator.values())))
+                        tool_executed = True # Lock execution for this turn
 
-                # STEP C: Stream Text Immediately
+                # C. Stream Content
                 if delta.content:
                     collected_content.append(delta.content)
                     yield b"data: " + orjson.dumps(chunk.model_dump()) + b"\n\n"
