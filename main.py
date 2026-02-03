@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
-from cachetools import TTLCache  # Changed to TTLCache for auto-purging
+from cachetools import TTLCache 
 
 # -----------------------------
 # 1. High-Performance Setup
@@ -25,10 +25,8 @@ client = AsyncAzureOpenAI(
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 
-# BEST SOLUTION: TTLCache (Time-To-Live)
-# maxsize=500 unique interactions, ttl=1200 seconds (20 minutes)
-# This automatically clears memory after a call ends.
-RESPONSE_CACHE = TTLCache(maxsize=500, ttl=1200)
+# Use TTLCache to auto-clear memory every 20 mins per session
+RESPONSE_CACHE = TTLCache(maxsize=1000, ttl=1200)
 
 app = FastAPI()
 
@@ -42,7 +40,6 @@ class Message(BaseModel):
     tool_calls: Optional[List[Any]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
-    user_id: Optional[str] = None # Added for session isolation
 
 class ChatRequest(BaseModel):
     messages: List[Message]
@@ -51,19 +48,15 @@ class ChatRequest(BaseModel):
     max_tokens: int = 150
 
 # -----------------------------
-# 3. Parallel Execution Logic
+# 3. Parallel Tool Dispatch
 # -----------------------------
 async def execute_tool_background(tool_call):
-    """Fire-and-forget tool execution to eliminate 1.1s latency spikes."""
-    try:
-        # Replace this with your actual tool logic (n8n call, etc.)
-        logger.info(f"Background Tool Triggered: {tool_call.get('function', {}).get('name')}")
-        # await your_n8n_client.call(...) 
-    except Exception as e:
-        logger.error(f"Background Tool Error: {e}")
+    """Executes tools in parallel so the agent keeps talking without a 1.2s lag."""
+    logger.info(f"Background Tool Dispatch: {tool_call.get('function', {}).get('name')}")
+    # Integration logic for n8n/DB goes here
 
 # -----------------------------
-# 4. Main Endpoint
+# 4. Optimized Logic
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
@@ -71,13 +64,21 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # ISOLATED CACHE KEY: user_id + last user message
-        # This prevents Donor A from getting Donor B's data.
-        user_id = req.messages[0].user_id if hasattr(req.messages[0], 'user_id') else "anon"
-        user_text = "".join([m.content for m in req.messages if m.role == "user"][-1:])
-        ckey = hashlib.md5(f"{user_id}:{user_text}".encode()).hexdigest()
+        # THE FIX: STATE-AWARE CACHE KEY
+        # We include the message count. "yes" at message 4 is different from "yes" at message 6.
+        msg_history = req.messages
+        msg_count = len(msg_history)
+        
+        # Pull user identity (assume first message or custom header holds it)
+        user_id = request.headers.get("x-user-id", "default_user") 
+        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-2:])
+        
+        # Combine ID + Content + Position in conversation to prevent loops
+        ckey_raw = f"{user_id}:{last_user_msg}:{msg_count}"
+        ckey = hashlib.md5(ckey_raw.encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
+            logger.info("Cache Hit - Serving isolated response")
             yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
@@ -86,8 +87,8 @@ async def chat_completions(req: ChatRequest, request: Request):
         try:
             kwargs = {
                 "model": DEPLOYMENT,
-                "messages": [m.model_dump(exclude_none=True) for m in req.messages[-10:]],
-                "temperature": 0.0, # Determenistic for rule adherence
+                "messages": [m.model_dump(exclude_none=True) for m in msg_history[-12:]],
+                "temperature": 0.0,
                 "stream": True,
                 "max_tokens": req.max_tokens,
                 "stream_options": {"include_usage": True},
@@ -105,8 +106,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             async for chunk in response:
                 chunk_data = chunk.model_dump(exclude_none=True)
                 
-                # PARALLEL DISPATCH: 
-                # If a tool call is detected, trigger it and KEEP STREAMING.
+                # Check for tool calls and trigger background execution immediately
                 if chunk.choices and chunk.choices[0].delta.tool_calls:
                     for tc in chunk.choices[0].delta.tool_calls:
                         asyncio.create_task(execute_tool_background(tc.model_dump()))
@@ -120,7 +120,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
                 if first_chunk:
                     first_chunk = False
-                    await asyncio.sleep(0) 
+                    await asyncio.sleep(0) # Flush first token immediately
 
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
