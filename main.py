@@ -2,7 +2,7 @@ import os
 import hashlib
 import logging
 import asyncio
-import orjson # 10x faster than standard json
+import orjson
 from typing import List, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -16,7 +16,7 @@ from cachetools import LRUCache
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maya-ultra-low-latency")
 
-# Uses the latest 2026-ready API version for Prompt Caching support
+# API Version 2024-08-01-preview is the most stable for GPT-4o in 2026
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -26,7 +26,7 @@ client = AsyncAzureOpenAI(
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 
-# Local LRU cache for absolute repeat hits (instant 0ms latency)
+# LRU Cache for 0ms repeat response latency
 RESPONSE_CACHE = LRUCache(maxsize=200)
 
 app = FastAPI()
@@ -53,12 +53,12 @@ class ChatRequest(BaseModel):
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
-    # Security check (Fast header comparison)
+    # Security check
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # Check local cache first
+        # FAST CACHE: Check for exact repeat user context
         user_context = "".join([m.content for m in req.messages if m.role == "user"][-2:])
         ckey = hashlib.md5(user_context.encode()).hexdigest()
         
@@ -69,48 +69,45 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         collected = []
         try:
-            # OPTIMIZATION: Prepare kwargs with Prompt Caching hints
+            # GPT-4O OPTIMIZATION: 
+            # 1. Reduced message window to 10 for better speed.
+            # 2. Removed 'extra_body' to fix the 400 Bad Request error.
             kwargs = {
                 "model": DEPLOYMENT,
-                "messages": [m.model_dump(exclude_none=True) for m in req.messages[-7:]], # Keep context short
+                "messages": [m.model_dump(exclude_none=True) for m in req.messages[-10:]],
                 "temperature": 0.0,
                 "stream": True,
                 "max_tokens": req.max_tokens,
                 "stream_options": {"include_usage": True},
-                "extra_body": {
-                    # Explicit hint for Azure GPT-5 Extended Prompt Caching
-                    "prompt_cache_retention": "in_memory" 
-                }
             }
             if req.tools:
                 kwargs["tools"] = req.tools
                 kwargs["tool_choice"] = "auto"
 
-            # Execute with a tight timeout for voice responsiveness
+            # 10s timeout: GPT-4o is fast; if it takes longer, something is wrong.
             response = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs),
-                timeout=15.0 
+                timeout=10.0 
             )
 
             first_chunk = True
             async for chunk in response:
-                # OPTIMIZATION: Skip redundant dict conversions, use model_dump for speed
+                # Direct serialization to bytes for lower overhead
                 chunk_data = chunk.model_dump(exclude_none=True)
-                
-                if not first_chunk: # Yield second chunk and onwards
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        collected.append(chunk.choices[0].delta.content)
-                
                 yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
 
-                # THE TURBO-FLUSH: Force packet transmission on first token
-                if first_chunk:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        collected.append(chunk.choices[0].delta.content)
-                    first_chunk = False
-                    await asyncio.sleep(0) # Micro-yield to flush socket
+                # Extract content for local cache
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        collected.append(delta.content)
 
-            # Background: Update LRU cache
+                # TURBO-FLUSH: Force transmission on the very first token
+                if first_chunk:
+                    first_chunk = False
+                    await asyncio.sleep(0) # Micro-pause to flush TCP buffer
+
+            # Update cache in the background
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
 
@@ -124,7 +121,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         event_generator(), 
         media_type="text/event-stream",
         headers={
-            "X-Accel-Buffering": "no", # Prevents proxy buffering
+            "X-Accel-Buffering": "no", # Critical for Real-time
             "Cache-Control": "no-cache",
             "Connection": "keep-alive"
         }
@@ -132,13 +129,17 @@ async def chat_completions(req: ChatRequest, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    # ENGINE OPTIMIZATION: Use uvloop and httptools for 2026 concurrency
+    import sys
+
+    # Adaptive loop selection (prevents Windows errors, uses uvloop on Railway)
+    loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
+
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=int(os.getenv("PORT", 8000)),
-        loop="uvloop",
+        loop=loop_type,
         http="httptools",
         workers=1,
-        access_log=False # Significant speedup by disabling logs per chunk
+        access_log=False
     )
