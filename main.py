@@ -29,7 +29,10 @@ client = AsyncAzureOpenAI(
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
+
+# We use two caches: one for text, one for tracking tool execution status
 RESPONSE_CACHE = LRUCache(maxsize=500)
+TOOL_EXECUTION_TRACKER = LRUCache(maxsize=500) # Track: ckey -> bool
 
 app = FastAPI()
 
@@ -39,20 +42,30 @@ class ChatRequest(BaseModel):
     stream: bool = True
     max_tokens: int = 150
 
-async def execute_tool_background(tool_list: List[dict]):
-    """This function is now wrapped to ensure logs only happen once."""
+async def execute_tool_background(tool_list: List[dict], ckey: str):
+    """Execution with a Global Lock check."""
+    # DOUBLE CHECK: If another worker/thread already finished this ckey, abort.
+    if TOOL_EXECUTION_TRACKER.get(ckey) == "EXECUTED":
+        return
+
+    TOOL_EXECUTION_TRACKER[ckey] = "EXECUTED"
     for tool in tool_list:
-        logger.info(f"⚡ [SINGLE EXEC] {tool.get('name')} | Args: {tool.get('args')}")
+        logger.info(f"⚡ [SINGLE EXEC] {tool.get('name')} | Turn: {ckey[:8]}")
+        # Your n8n/webhook logic here
 
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
+    # Generate a unique key for THIS turn (User ID + Last Msg Content)
+    user_id = request.headers.get("x-user-id", "anon")
+    last_msg = str(req.messages[-1])
+    ckey = hashlib.md5(f"{user_id}:{last_msg}".encode()).hexdigest()
+
     async def event_generator():
-        # --- REQUEST SCOPE STATE ---
-        # These variables reset every time a new call comes in
-        executed_in_this_turn = False 
+        # Local lock for this specific stream instance
+        stream_instance_fired = False 
         tool_buffer = {}
         collected_text = []
 
@@ -64,10 +77,10 @@ async def chat_completions(req: ChatRequest, request: Request):
                 "stream": True,
                 "max_tokens": req.max_tokens,
                 "stream_options": {"include_usage": True},
+                "parallel_tool_calls": False
             }
             if req.tools:
                 kwargs["tools"] = req.tools
-                kwargs["parallel_tool_calls"] = False # Force 1 tool at a time
 
             response = await client.chat.completions.create(**kwargs)
 
@@ -76,26 +89,25 @@ async def chat_completions(req: ChatRequest, request: Request):
                 delta = chunk.choices[0].delta
                 finish_reason = chunk.choices[0].finish_reason
 
-                # 1. Capture Tool Data
+                # 1. Reconstruct Tool JSON
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
                         idx = tc.index
                         if idx not in tool_buffer:
                             tool_buffer[idx] = {"name": "", "args": ""}
-                        if tc.function.name:
-                            tool_buffer[idx]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            tool_buffer[idx]["args"] += tc.function.arguments
+                        if tc.function.name: tool_buffer[idx]["name"] += tc.function.name
+                        if tc.function.arguments: tool_buffer[idx]["args"] += tc.function.arguments
 
-                # 2. THE LOCK: Only fire if finish_reason is exactly 'tool_calls'
-                # AND we haven't flipped our local toggle yet.
-                if finish_reason == "tool_calls" and not executed_in_this_turn:
-                    if tool_buffer:
-                        # Fire and forget
-                        asyncio.create_task(execute_tool_background(list(tool_buffer.values())))
-                        executed_in_this_turn = True 
+                # 2. TRIGGER WITH TRIPLE LOCK
+                # Check 1: Finish reason hit?
+                # Check 2: Has this specific stream fired yet?
+                # Check 3: Has this conversation turn (ckey) been marked as executed in global cache?
+                if finish_reason == "tool_calls" and not stream_instance_fired:
+                    if ckey not in TOOL_EXECUTION_TRACKER:
+                        if tool_buffer:
+                            asyncio.create_task(execute_tool_background(list(tool_buffer.values()), ckey))
+                            stream_instance_fired = True
 
-                # 3. Stream Speech
                 if delta.content:
                     collected_text.append(delta.content)
                     yield b"data: " + orjson.dumps(chunk.model_dump(exclude_none=True)) + b"\n\n"
@@ -110,5 +122,5 @@ async def chat_completions(req: ChatRequest, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    # STRICTLY 1 WORKER to prevent multi-process log duplication
+    # Set workers to 1 to ensure the TOOL_EXECUTION_TRACKER (memory) is shared
     uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1, access_log=False)
