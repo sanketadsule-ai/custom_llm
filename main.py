@@ -9,15 +9,12 @@ from pydantic import BaseModel, ConfigDict
 from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
 from cachetools import TTLCache 
-import httpx # For high-performance connection pooling
+import httpx
 
-# -----------------------------
-# 1. Setup & Performance Tuning
-# -----------------------------
+# 1. SETUP
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maya-turbo-bridge")
 
-# Using a persistent AsyncClient for connection pooling (saves ~100-300ms per call)
 http_client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
     timeout=httpx.Timeout(10.0, read=None)
@@ -27,7 +24,7 @@ client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version="2024-08-01-preview", 
-    http_client=http_client # Injecting the high-perf client
+    http_client=http_client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
@@ -36,9 +33,7 @@ RESPONSE_CACHE = TTLCache(maxsize=1000, ttl=1200)
 
 app = FastAPI()
 
-# -----------------------------
-# 2. Data Models
-# -----------------------------
+# 2. MODELS
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     role: str
@@ -53,121 +48,93 @@ class ChatRequest(BaseModel):
     stream: bool = True
     max_tokens: int = 150
 
-# -----------------------------
-# 3. Enhanced Tool Execution
-# -----------------------------
-async def execute_tool_silently(tool_calls: List[dict]):
+# 3. TOOL EXECUTION
+async def execute_tool_silently(tool_name: str, args: str):
     """
     Fire-and-forget background execution. 
+    Maya is already speaking while this runs.
     """
-    for tool_call in tool_calls:
-        func = tool_call.get("function", {})
-        name = func.get("name")
-        args = func.get("arguments")
-        
-        if name:
-            # Note: Do not 'await' long-running tasks here if they block.
-            # Use httpx.AsyncClient for external webhooks to maintain async flow.
-            logger.info(f"⚡ [EXEC] {name} | Args: {args}")
+    logger.info(f"⚡ [SINGLE EXEC] {tool_name} | Args: {args}")
+    # ADD YOUR Webhook/n8n logic here
 
-# -----------------------------
-# 4. Latency-First Loop
-# -----------------------------
+# 4. THE LOOP
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # --- PRE-PROCESSING OPTIMIZATION ---
         msg_history = req.messages
         msg_count = len(msg_history)
         user_id = request.headers.get("x-user-id", "default_donor") 
         last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-1:])
-        
-        # Cache lookup using MD5 for O(1) speed
         ckey = hashlib.md5(f"{user_id}:{last_user_msg}:{msg_count}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
-            cached_text = RESPONSE_CACHE[ckey]
-            yield b"data: " + orjson.dumps({"choices":[{"delta":{"content": cached_text}}]}) + b"\n\n"
+            yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
 
         collected = []
+        
+        # --- THE FIX: PER-REQUEST STATE ---
+        executed_tool_ids = set() # Track IDs we already fired
+        tool_buffer = {}          # Buffer chunks for each tool index
+
         try:
-            # --- MODEL PARAMS OPTIMIZATION ---
             kwargs = {
                 "model": DEPLOYMENT,
-                # Slice history to last 6-8 messages to reduce prompt processing time
                 "messages": [m.model_dump(exclude_none=True) for m in msg_history[-8:]],
                 "temperature": 0.0,
                 "stream": True,
-                "max_tokens": 80, # Keep responses concise to lower generation latency
-                "presence_penalty": 0,
-                "frequency_penalty": 0,
+                "max_tokens": 100,
             }
             if req.tools:
                 kwargs["tools"] = req.tools
-                # Consider adding tool_choice="auto" specifically if needed
+                # Disabling parallel calls can also help stabilize 3.5-turbo
+                kwargs["parallel_tool_calls"] = False 
 
-            # Wait for stream with a strict timeout
-            response = await asyncio.wait_for(
-                client.chat.completions.create(**kwargs), 
-                timeout=10.0
-            )
+            response = await client.chat.completions.create(**kwargs)
 
             async for chunk in response:
                 if not chunk.choices: continue
                 delta = chunk.choices[0].delta
                 
-                # Immediate handling for tool calls
+                # 1. Accumulate Tool Chunks
                 if delta.tool_calls:
-                    # We only trigger once per tool call ID to prevent redundant logs
-                    if delta.tool_calls[0].id: 
-                        asyncio.create_task(execute_tool_silently([tc.model_dump() for tc in delta.tool_calls]))
-                    continue
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_buffer:
+                            tool_buffer[idx] = {"id": None, "name": "", "args": ""}
+                        
+                        if tc.id: tool_buffer[idx]["id"] = tc.id
+                        if tc.function.name: tool_buffer[idx]["name"] += tc.function.name
+                        if tc.function.arguments: tool_buffer[idx]["args"] += tc.function.arguments
 
-                # Stream text content immediately to the user
+                # 2. Trigger Task ONLY on Finish Signal
+                finish_reason = chunk.choices[0].finish_reason
+                if finish_reason == "tool_calls":
+                    for idx, data in tool_buffer.items():
+                        t_id = data["id"] or f"idx_{idx}"
+                        if t_id not in executed_tool_ids:
+                            asyncio.create_task(execute_tool_silently(data["name"], data["args"]))
+                            executed_tool_ids.add(t_id)
+
+                # 3. Stream Text
                 if delta.content:
                     collected.append(delta.content)
-                    # use orjson for faster serialization than standard json.dumps
                     yield b"data: " + orjson.dumps(chunk.model_dump()) + b"\n\n"
 
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
-
             yield b"data: [DONE]\n\n"
 
-        except asyncio.TimeoutError:
-            logger.error("⏰ Azure OpenAI Timeout")
-            yield b"data: [DONE]\n\n"
         except Exception as e:
-            logger.error(f"❌ Streaming Error: {e}")
+            logger.error(f"❌ Error: {e}")
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(
-        event_generator(), 
-        media_type="text/event-stream",
-        headers={
-            "X-Accel-Buffering": "no", # Critical for Nginx/Proxies
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
-    # Use uvloop for 2-3x better performance on Linux
-    import sys
-    loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-    
-    uvicorn.run(
-        "main:app", 
-        host="0.0.0.0", 
-        port=int(os.getenv("PORT", 8000)), 
-        loop=loop_type,
-        http="httptools", # Faster HTTP parser
-        workers=1,
-        access_log=False # Reduce I/O overhead
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), workers=1)
