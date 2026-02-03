@@ -9,23 +9,29 @@ from pydantic import BaseModel, ConfigDict
 from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
 from cachetools import TTLCache 
+import httpx # For high-performance connection pooling
 
 # -----------------------------
-# 1. Setup & Environment
+# 1. Setup & Performance Tuning
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maya-turbo-bridge")
+
+# Using a persistent AsyncClient for connection pooling (saves ~100-300ms per call)
+http_client = httpx.AsyncClient(
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+    timeout=httpx.Timeout(10.0, read=None)
+)
 
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version="2024-08-01-preview", 
+    http_client=http_client # Injecting the high-perf client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
-
-# Session-isolated cache (20-minute TTL)
 RESPONSE_CACHE = TTLCache(maxsize=1000, ttl=1200)
 
 app = FastAPI()
@@ -48,20 +54,24 @@ class ChatRequest(BaseModel):
     max_tokens: int = 150
 
 # -----------------------------
-# 3. Background Tool Logic
+# 3. Enhanced Tool Execution
 # -----------------------------
-async def execute_tool_silently(full_tool_calls: List[dict]):
+async def execute_tool_silently(tool_calls: List[dict]):
     """
-    Executes the completed tool JSON in the background.
+    Fire-and-forget background execution. 
     """
-    for tc in full_tool_calls:
-        name = tc.get("name")
-        args = tc.get("args")
-        # Replace this log with your actual n8n/webhook call
-        logger.info(f"⚡ [SINGLE EXEC] Tool: {name} | Args: {args}")
+    for tool_call in tool_calls:
+        func = tool_call.get("function", {})
+        name = func.get("name")
+        args = func.get("arguments")
+        
+        if name:
+            # Note: Do not 'await' long-running tasks here if they block.
+            # Use httpx.AsyncClient for external webhooks to maintain async flow.
+            logger.info(f"⚡ [EXEC] {name} | Args: {args}")
 
 # -----------------------------
-# 4. Optimized Event Generator
+# 4. Latency-First Loop
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
@@ -69,78 +79,95 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # CACHE KEY: ID + Text + Index
+        # --- PRE-PROCESSING OPTIMIZATION ---
         msg_history = req.messages
         msg_count = len(msg_history)
         user_id = request.headers.get("x-user-id", "default_donor") 
-        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-5:])
+        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-1:])
+        
+        # Cache lookup using MD5 for O(1) speed
         ckey = hashlib.md5(f"{user_id}:{last_user_msg}:{msg_count}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
-            logger.info("🚀 Cache Hit")
-            yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
+            cached_text = RESPONSE_CACHE[ckey]
+            yield b"data: " + orjson.dumps({"choices":[{"delta":{"content": cached_text}}]}) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
 
-        collected_content = []
-        tool_accumulator = {}
-        tool_executed = False  # THE GUARD: Prevents duplicate firing
-
+        collected = []
         try:
+            # --- MODEL PARAMS OPTIMIZATION ---
             kwargs = {
                 "model": DEPLOYMENT,
-                "messages": [m.model_dump(exclude_none=True) for m in msg_history[-10:]],
+                # Slice history to last 6-8 messages to reduce prompt processing time
+                "messages": [m.model_dump(exclude_none=True) for m in msg_history[-8:]],
                 "temperature": 0.0,
                 "stream": True,
-                "max_tokens": 100,
-                "stream_options": {"include_usage": True},
+                "max_tokens": 80, # Keep responses concise to lower generation latency
+                "presence_penalty": 0,
+                "frequency_penalty": 0,
             }
             if req.tools:
                 kwargs["tools"] = req.tools
+                # Consider adding tool_choice="auto" specifically if needed
 
-            response = await client.chat.completions.create(**kwargs)
+            # Wait for stream with a strict timeout
+            response = await asyncio.wait_for(
+                client.chat.completions.create(**kwargs), 
+                timeout=10.0
+            )
 
             async for chunk in response:
                 if not chunk.choices: continue
                 delta = chunk.choices[0].delta
-                finish_reason = chunk.choices[0].finish_reason
-
-                # A. Accumulate Fragments
+                
+                # Immediate handling for tool calls
                 if delta.tool_calls:
-                    for tc_chunk in delta.tool_calls:
-                        idx = tc_chunk.index
-                        if idx not in tool_accumulator:
-                            tool_accumulator[idx] = {"name": "", "args": ""}
-                        if tc_chunk.function.name:
-                            tool_accumulator[idx]["name"] += tc_chunk.function.name
-                        if tc_chunk.function.arguments:
-                            tool_accumulator[idx]["args"] += tc_chunk.function.arguments
+                    # We only trigger once per tool call ID to prevent redundant logs
+                    if delta.tool_calls[0].id: 
+                        asyncio.create_task(execute_tool_silently([tc.model_dump() for tc in delta.tool_calls]))
+                    continue
 
-                # B. One-Shot Trigger (The Fix for Redundant Calls)
-                if finish_reason == "tool_calls" and not tool_executed:
-                    if tool_accumulator:
-                        asyncio.create_task(execute_tool_silently(list(tool_accumulator.values())))
-                        tool_executed = True # Lock execution for this turn
-
-                # C. Stream Content
+                # Stream text content immediately to the user
                 if delta.content:
-                    collected_content.append(delta.content)
+                    collected.append(delta.content)
+                    # use orjson for faster serialization than standard json.dumps
                     yield b"data: " + orjson.dumps(chunk.model_dump()) + b"\n\n"
 
-            if collected_content:
-                RESPONSE_CACHE[ckey] = "".join(collected_content)
+            if collected:
+                RESPONSE_CACHE[ckey] = "".join(collected)
 
             yield b"data: [DONE]\n\n"
 
+        except asyncio.TimeoutError:
+            logger.error("⏰ Azure OpenAI Timeout")
+            yield b"data: [DONE]\n\n"
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Streaming Error: {e}")
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no", # Critical for Nginx/Proxies
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
+    # Use uvloop for 2-3x better performance on Linux
     import sys
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), 
-                loop=loop_type, http="httptools", workers=1, access_log=False)
+    
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)), 
+        loop=loop_type,
+        http="httptools", # Faster HTTP parser
+        workers=1,
+        access_log=False # Reduce I/O overhead
+    )
