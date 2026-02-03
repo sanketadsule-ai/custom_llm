@@ -1,13 +1,8 @@
-# Core Framework
+# requirements.txt
 fastapi==0.115.*
 uvicorn[standard]==0.34.*
-
-# High-Performance Logic
-orjson==3.10.* # Rust-based JSON for 10x faster serialization
-uvloop==0.21.0 # C-based event loop (Linux/macOS only)
-httptools==0.6.* # C-based HTTP parser for Uvicorn
-cachetools==5.5.0       # Memory-efficient LRU caching
-
-# AI & Network
-openai>=1.50.0          # Azure OpenAI async client support
-python-dotenv==1.0.1    # Environment variable management
+orjson==3.10.*
+openai>=1.50.0
+uvloop==0.21.0; sys_platform != 'win32'  # <--- Essential for the Docker build
+httptools==0.6.4
+cachetools==5.5.0
