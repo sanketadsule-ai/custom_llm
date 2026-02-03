@@ -11,12 +11,11 @@ from fastapi.responses import StreamingResponse
 from cachetools import TTLCache 
 
 # -----------------------------
-# 1. High-Performance Setup
+# 1. Setup & Environment
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maya-turbo-bridge")
 
-# Azure OpenAI Client
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -26,13 +25,13 @@ client = AsyncAzureOpenAI(
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 
-# isolated session cache (20-minute expiry)
+# Session-isolated cache (20-minute TTL)
 RESPONSE_CACHE = TTLCache(maxsize=1000, ttl=1200)
 
 app = FastAPI()
 
 # -----------------------------
-# 2. Optimized Models
+# 2. Data Models
 # -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -49,22 +48,21 @@ class ChatRequest(BaseModel):
     max_tokens: int = 150
 
 # -----------------------------
-# 3. Turbo Latency Killers
+# 3. Background Tool Logic
 # -----------------------------
-async def execute_tool_silently(tool_calls: List[dict]):
+async def execute_tool_silently(full_tool_calls: List[dict]):
     """
-    Fire-and-forget execution. 
-    Maya keeps talking while the database/n8n updates in the background.
+    Executes the completed tool JSON in the background.
+    Maya is already speaking while this runs.
     """
-    for tool_call in tool_calls:
-        name = tool_call.get("function", {}).get("name")
-        args = tool_call.get("function", {}).get("arguments")
-        logger.info(f"⚡ Background Exec: {name} with args {args}")
-        # Add your n8n webhook call here:
-        # await n8n_client.post("/webhook", json={"tool": name, "data": args})
+    for tc in full_tool_calls:
+        name = tc.get("name")
+        args = tc.get("args")
+        # LOGGING ONLY - Replace with your actual n8n/webhook call
+        logger.info(f"⚡ Executing Tool: {name} | Args: {args}")
 
 # -----------------------------
-# 4. Main Execution Engine
+# 4. Optimized Event Generator
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
@@ -72,92 +70,75 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # SESSION ISOLATION: Key = UserID + Last Msg + Msg Count
+        # CACHE KEY: ID + Text + Index (Prevents Loops)
         msg_history = req.messages
         msg_count = len(msg_history)
         user_id = request.headers.get("x-user-id", "default_donor") 
         last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-1:])
-        
         ckey = hashlib.md5(f"{user_id}:{last_user_msg}:{msg_count}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
-            logger.info("🚀 Cache Hit: Serving isolated response")
+            logger.info("🚀 Cache Hit")
             yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
 
-        collected = []
+        collected_content = []
+        tool_accumulator = {} # Buffers fragments
+
         try:
-            # TURBO KWARGS: Minimal penalties for faster inference
             kwargs = {
                 "model": DEPLOYMENT,
-                "messages": [m.model_dump(exclude_none=True) for m in msg_history[-12:]],
+                "messages": [m.model_dump(exclude_none=True) for m in msg_history[-10:]],
                 "temperature": 0.0,
                 "stream": True,
-                "max_tokens": 80, # Keep Maya's turns short and fast
-                "presence_penalty": 0,
-                "frequency_penalty": 0,
+                "max_tokens": 100,
                 "stream_options": {"include_usage": True},
             }
             if req.tools:
                 kwargs["tools"] = req.tools
-                kwargs["tool_choice"] = "auto"
 
-            response = await asyncio.wait_for(
-                client.chat.completions.create(**kwargs),
-                timeout=15.0 
-            )
+            response = await client.chat.completions.create(**kwargs)
 
-            first_chunk = True
             async for chunk in response:
                 if not chunk.choices: continue
-                
                 delta = chunk.choices[0].delta
-                
-                # PARALLEL EXECUTION: Trigger tools in background, keep streaming text
-                if delta.tool_calls:
-                    asyncio.create_task(execute_tool_silently([tc.model_dump() for tc in delta.tool_calls]))
-                    continue # Skip sending tool JSON to the audio engine
+                finish_reason = chunk.choices[0].finish_reason
 
+                # STEP A: Accumulate Tool Fragments
+                if delta.tool_calls:
+                    for tc_chunk in delta.tool_calls:
+                        idx = tc_chunk.index
+                        if idx not in tool_accumulator:
+                            tool_accumulator[idx] = {"name": "", "args": ""}
+                        if tc_chunk.function.name:
+                            tool_accumulator[idx]["name"] += tc_chunk.function.name
+                        if tc_chunk.function.arguments:
+                            tool_accumulator[idx]["args"] += tc_chunk.function.arguments
+
+                # STEP B: Trigger Background Execution on Completion
+                if finish_reason == "tool_calls":
+                    asyncio.create_task(execute_tool_silently(list(tool_accumulator.values())))
+
+                # STEP C: Stream Text Immediately
                 if delta.content:
-                    collected.append(delta.content)
-                    # Yield content immediately to the donor
+                    collected_content.append(delta.content)
                     yield b"data: " + orjson.dumps(chunk.model_dump()) + b"\n\n"
 
-                if first_chunk:
-                    first_chunk = False
-                    await asyncio.sleep(0) # Flush TCP buffer
-
-            if collected:
-                RESPONSE_CACHE[ckey] = "".join(collected)
+            if collected_content:
+                RESPONSE_CACHE[ckey] = "".join(collected_content)
 
             yield b"data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"❌ Streaming Error: {e}")
+            logger.error(f"❌ Error: {e}")
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(
-        event_generator(), 
-        media_type="text/event-stream",
-        headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
     import sys
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-
-    uvicorn.run(
-        "main:app", 
-        host="0.0.0.0", 
-        port=int(os.getenv("PORT", 8000)),
-        loop=loop_type,
-        http="httptools",
-        workers=1,
-        access_log=False
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), 
+                loop=loop_type, http="httptools", workers=1, access_log=False)
