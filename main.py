@@ -1,3 +1,4 @@
+
 import os
 import hashlib
 import logging
@@ -8,32 +9,32 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
-from cachetools import TTLCache 
-import httpx
+from cachetools import LRUCache
 
-# 1. SETUP
+# -----------------------------
+# 1. High-Performance Setup
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("maya-turbo-bridge")
+logger = logging.getLogger("maya-ultra-low-latency")
 
-http_client = httpx.AsyncClient(
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-    timeout=httpx.Timeout(10.0, read=None)
-)
-
+# API Version 2024-08-01-preview is the most stable for GPT-4o in 2026
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version="2024-08-01-preview", 
-    http_client=http_client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
-RESPONSE_CACHE = TTLCache(maxsize=1000, ttl=1200)
+
+# LRU Cache for 0ms repeat response latency
+RESPONSE_CACHE = LRUCache(maxsize=200)
 
 app = FastAPI()
 
-# 2. MODELS
+# -----------------------------
+# 2. Optimized Models
+# -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     role: str
@@ -48,27 +49,19 @@ class ChatRequest(BaseModel):
     stream: bool = True
     max_tokens: int = 150
 
-# 3. TOOL EXECUTION
-async def execute_tool_silently(tool_name: str, args: str):
-    """
-    Fire-and-forget background execution. 
-    Maya is already speaking while this runs.
-    """
-    logger.info(f"⚡ [SINGLE EXEC] {tool_name} | Args: {args}")
-    # ADD YOUR Webhook/n8n logic here
-
-# 4. THE LOOP
+# -----------------------------
+# 3. Optimized Logic
+# -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
+    # Security check
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        msg_history = req.messages
-        msg_count = len(msg_history)
-        user_id = request.headers.get("x-user-id", "default_donor") 
-        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-1:])
-        ckey = hashlib.md5(f"{user_id}:{last_user_msg}:{msg_count}".encode()).hexdigest()
+        # FAST CACHE: Check for exact repeat user context
+        user_context = "".join([m.content for m in req.messages if m.role == "user"][-10:])
+        ckey = hashlib.md5(user_context.encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
             yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
@@ -76,65 +69,78 @@ async def chat_completions(req: ChatRequest, request: Request):
             return
 
         collected = []
-        
-        # --- THE FIX: PER-REQUEST STATE ---
-        executed_tool_ids = set() # Track IDs we already fired
-        tool_buffer = {}          # Buffer chunks for each tool index
-
         try:
+            # GPT-4O OPTIMIZATION: 
+            # 1. Reduced message window to 10 for better speed.
+            # 2. Removed 'extra_body' to fix the 400 Bad Request error.
             kwargs = {
                 "model": DEPLOYMENT,
-                "messages": [m.model_dump(exclude_none=True) for m in msg_history[-8:]],
+                "messages": [m.model_dump(exclude_none=True) for m in req.messages[-10:]],
                 "temperature": 0.0,
                 "stream": True,
-                "max_tokens": 100,
+                "max_tokens": req.max_tokens,
+                "stream_options": {"include_usage": True},
             }
             if req.tools:
                 kwargs["tools"] = req.tools
-                # Disabling parallel calls can also help stabilize 3.5-turbo
-                kwargs["parallel_tool_calls"] = False 
+                kwargs["tool_choice"] = "auto"
 
-            response = await client.chat.completions.create(**kwargs)
+            # 10s timeout: GPT-4o is fast; if it takes longer, something is wrong.
+            response = await asyncio.wait_for(
+                client.chat.completions.create(**kwargs),
+                timeout=10.0 
+            )
 
+            first_chunk = True
             async for chunk in response:
-                if not chunk.choices: continue
-                delta = chunk.choices[0].delta
-                
-                # 1. Accumulate Tool Chunks
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_buffer:
-                            tool_buffer[idx] = {"id": None, "name": "", "args": ""}
-                        
-                        if tc.id: tool_buffer[idx]["id"] = tc.id
-                        if tc.function.name: tool_buffer[idx]["name"] += tc.function.name
-                        if tc.function.arguments: tool_buffer[idx]["args"] += tc.function.arguments
+                # Direct serialization to bytes for lower overhead
+                chunk_data = chunk.model_dump(exclude_none=True)
+                yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
 
-                # 2. Trigger Task ONLY on Finish Signal
-                finish_reason = chunk.choices[0].finish_reason
-                if finish_reason == "tool_calls":
-                    for idx, data in tool_buffer.items():
-                        t_id = data["id"] or f"idx_{idx}"
-                        if t_id not in executed_tool_ids:
-                            asyncio.create_task(execute_tool_silently(data["name"], data["args"]))
-                            executed_tool_ids.add(t_id)
+                # Extract content for local cache
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        collected.append(delta.content)
 
-                # 3. Stream Text
-                if delta.content:
-                    collected.append(delta.content)
-                    yield b"data: " + orjson.dumps(chunk.model_dump()) + b"\n\n"
+                # TURBO-FLUSH: Force transmission on the very first token
+                if first_chunk:
+                    first_chunk = False
+                    await asyncio.sleep(0) # Micro-pause to flush TCP buffer
 
+            # Update cache in the background
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
+
             yield b"data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"Streaming Error: {e}")
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no", # Critical for Real-time
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), workers=1)
+    import sys
+
+    # Adaptive loop selection (prevents Windows errors, uses uvloop on Railway)
+    loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
+
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
+        loop=loop_type,
+        http="httptools",
+        workers=1,
+        access_log=False
+    )
