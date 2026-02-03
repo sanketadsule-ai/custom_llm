@@ -14,8 +14,9 @@ from cachetools import TTLCache
 # 1. High-Performance Setup
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("maya-ultra-low-latency")
+logger = logging.getLogger("maya-turbo-bridge")
 
+# Azure OpenAI Client
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -25,7 +26,7 @@ client = AsyncAzureOpenAI(
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 
-# Use TTLCache to auto-clear memory every 20 mins per session
+# isolated session cache (20-minute expiry)
 RESPONSE_CACHE = TTLCache(maxsize=1000, ttl=1200)
 
 app = FastAPI()
@@ -48,15 +49,22 @@ class ChatRequest(BaseModel):
     max_tokens: int = 150
 
 # -----------------------------
-# 3. Parallel Tool Dispatch
+# 3. Turbo Latency Killers
 # -----------------------------
-async def execute_tool_background(tool_call):
-    """Executes tools in parallel so the agent keeps talking without a 1.2s lag."""
-    logger.info(f"Background Tool Dispatch: {tool_call.get('function', {}).get('name')}")
-    # Integration logic for n8n/DB goes here
+async def execute_tool_silently(tool_calls: List[dict]):
+    """
+    Fire-and-forget execution. 
+    Maya keeps talking while the database/n8n updates in the background.
+    """
+    for tool_call in tool_calls:
+        name = tool_call.get("function", {}).get("name")
+        args = tool_call.get("function", {}).get("arguments")
+        logger.info(f"⚡ Background Exec: {name} with args {args}")
+        # Add your n8n webhook call here:
+        # await n8n_client.post("/webhook", json={"tool": name, "data": args})
 
 # -----------------------------
-# 4. Optimized Logic
+# 4. Main Execution Engine
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
@@ -64,33 +72,31 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # THE FIX: STATE-AWARE CACHE KEY
-        # We include the message count. "yes" at message 4 is different from "yes" at message 6.
+        # SESSION ISOLATION: Key = UserID + Last Msg + Msg Count
         msg_history = req.messages
         msg_count = len(msg_history)
+        user_id = request.headers.get("x-user-id", "default_donor") 
+        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-1:])
         
-        # Pull user identity (assume first message or custom header holds it)
-        user_id = request.headers.get("x-user-id", "default_user") 
-        last_user_msg = "".join([m.content for m in msg_history if m.role == "user"][-2:])
-        
-        # Combine ID + Content + Position in conversation to prevent loops
-        ckey_raw = f"{user_id}:{last_user_msg}:{msg_count}"
-        ckey = hashlib.md5(ckey_raw.encode()).hexdigest()
+        ckey = hashlib.md5(f"{user_id}:{last_user_msg}:{msg_count}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
-            logger.info("Cache Hit - Serving isolated response")
+            logger.info("🚀 Cache Hit: Serving isolated response")
             yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
 
         collected = []
         try:
+            # TURBO KWARGS: Minimal penalties for faster inference
             kwargs = {
                 "model": DEPLOYMENT,
                 "messages": [m.model_dump(exclude_none=True) for m in msg_history[-12:]],
                 "temperature": 0.0,
                 "stream": True,
-                "max_tokens": req.max_tokens,
+                "max_tokens": 80, # Keep Maya's turns short and fast
+                "presence_penalty": 0,
+                "frequency_penalty": 0,
                 "stream_options": {"include_usage": True},
             }
             if req.tools:
@@ -99,28 +105,28 @@ async def chat_completions(req: ChatRequest, request: Request):
 
             response = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs),
-                timeout=10.0 
+                timeout=15.0 
             )
 
             first_chunk = True
             async for chunk in response:
-                chunk_data = chunk.model_dump(exclude_none=True)
+                if not chunk.choices: continue
                 
-                # Check for tool calls and trigger background execution immediately
-                if chunk.choices and chunk.choices[0].delta.tool_calls:
-                    for tc in chunk.choices[0].delta.tool_calls:
-                        asyncio.create_task(execute_tool_background(tc.model_dump()))
+                delta = chunk.choices[0].delta
+                
+                # PARALLEL EXECUTION: Trigger tools in background, keep streaming text
+                if delta.tool_calls:
+                    asyncio.create_task(execute_tool_silently([tc.model_dump() for tc in delta.tool_calls]))
+                    continue # Skip sending tool JSON to the audio engine
 
-                yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
-
-                if chunk.choices and len(chunk.choices) > 0:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        collected.append(delta.content)
+                if delta.content:
+                    collected.append(delta.content)
+                    # Yield content immediately to the donor
+                    yield b"data: " + orjson.dumps(chunk.model_dump()) + b"\n\n"
 
                 if first_chunk:
                     first_chunk = False
-                    await asyncio.sleep(0) # Flush first token immediately
+                    await asyncio.sleep(0) # Flush TCP buffer
 
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
@@ -128,7 +134,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             yield b"data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"Streaming Error: {e}")
+            logger.error(f"❌ Streaming Error: {e}")
             yield b"data: [DONE]\n\n"
 
     return StreamingResponse(
