@@ -61,7 +61,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     async def event_generator():
         user_id = request.headers.get("x-user-id", "anonymous")
-        user_context = "".join([m.content for m in req.messages if m.role == "user"][-10:])
+        user_context = "".join([m.content for m in req.messages if m.role == "user"][-5:])
         ckey = hashlib.md5(f"{user_id}:{user_context}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
@@ -71,21 +71,28 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         collected = []
         try:
-            # --- CONTEXT PERSISTENCE LOGIC ---
-            # Extract the system message (which contains the rules and variables)
+            # 1. Separate System Message
             system_msg = next((m for m in req.messages if m.role == "system"), None)
             
-            # Get only the most recent conversation history (last 9 messages)
-            # This prevents the context from becoming too large/expensive
-            history = [m for m in req.messages if m.role != "system"][-9:]
+            # 2. Extract History (Excluding System)
+            history_pool = [m for m in req.messages if m.role != "system"]
             
+            # 3. Slicing with Tool Integrity
+            # We take the last 10 messages, but check if the first one is a 'tool'
+            slice_index = -10
+            if abs(slice_index) < len(history_pool):
+                # If the first message in our slice is a 'tool', we MUST include the one before it
+                if history_pool[slice_index].role == "tool":
+                    slice_index -= 1 
+            
+            recent_history = history_pool[slice_index:]
+            
+            # 4. Reconstruct final payload
             final_messages = []
             if system_msg:
-                # RE-INJECT VARIABLES (Optional: Replace strings if passed in headers)
-                # content = system_msg.content.replace("{{customer_name}}", request.headers.get("x-customer-name", "Donor"))
                 final_messages.append(system_msg.model_dump(exclude_none=True))
             
-            final_messages.extend([m.model_dump(exclude_none=True) for m in history])
+            final_messages.extend([m.model_dump(exclude_none=True) for m in recent_history])
 
             kwargs = {
                 "model": DEPLOYMENT,
@@ -102,7 +109,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
             response = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs),
-                timeout=10.0 
+                timeout=15.0 # Increased slightly for tool-heavy processing
             )
 
             first_chunk = True
@@ -126,6 +133,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         except Exception as e:
             logger.error(f"Streaming Error: {e}")
+            # Ensure the stream closes cleanly on error
             yield b"data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -145,15 +153,5 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
     import sys
-
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-
-    uvicorn.run(
-        "main:app", 
-        host="0.0.0.0", 
-        port=int(os.getenv("PORT", 8000)),
-        loop=loop_type,
-        http="httptools",
-        workers=1,
-        access_log=False
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), loop=loop_type)
