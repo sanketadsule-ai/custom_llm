@@ -61,7 +61,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     async def event_generator():
         user_id = request.headers.get("x-user-id", "anonymous")
-        user_context = "".join([m.content for m in req.messages if m.role == "user"][-5:])
+        user_context = "".join([m.content for m in req.messages if m.role == "user"][-10:])
         ckey = hashlib.md5(f"{user_id}:{user_context}".encode()).hexdigest()
         
         if ckey in RESPONSE_CACHE:
