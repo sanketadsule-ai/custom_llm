@@ -213,7 +213,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[Message]
     stream: bool = True
-    max_tokens: int = 80  # Tuned for voice: most spoken answers are 30-80 tokens
+    max_completion_tokens: int = 80  # Tuned for voice: most spoken answers are 30-80 tokens
 
 
 # -----------------------------
@@ -226,7 +226,7 @@ async def warmup():
         await client.chat.completions.create(
             model=DEPLOYMENT,
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1
+            max_completion_tokens=1
         )
         logger.warning("Azure connection pre-warmed successfully.")
     except Exception as e:
@@ -272,7 +272,7 @@ async def chat_completions(req: ChatRequest, request: Request):
                 messages=final_messages,
                  # Sounds more natural for voice
                 stream=True,
-                max_completion_tokens=req.max_tokens,
+                max_completion_tokens=req.max_completion_tokens,
             )
 
             async for chunk in response:
