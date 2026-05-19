@@ -270,7 +270,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             response = await client.chat.completions.create(
                 model=DEPLOYMENT,
                 messages=final_messages,
-                temperature=0.7,  # Sounds more natural for voice
+                 # Sounds more natural for voice
                 stream=True,
                 max_completion_tokens=req.max_tokens,
             )
