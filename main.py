@@ -272,7 +272,7 @@ async def chat_completions(req: ChatRequest, request: Request):
                 messages=final_messages,
                 temperature=0.7,  # Sounds more natural for voice
                 stream=True,
-                max_tokens=req.max_tokens,
+                max_completion_tokens=req.max_tokens,
             )
 
             async for chunk in response:
