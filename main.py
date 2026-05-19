@@ -338,13 +338,22 @@ async def health():
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
+    import os
     import sys
 
+    # Railway provides the PORT environment variable. 
+    # We MUST use it, and we MUST bind to 0.0.0.0
+    port = int(os.getenv("PORT", 8000))
+    
+    # Use uvloop for maximum networking performance on Linux (Railway)
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
+
     uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
+        "main:app",            # Use the string "file_name:app_variable"
+        host="0.0.0.0",        # Mandatory for Railway
+        port=port,             # Use the dynamic port from Railway
         loop=loop_type,
         log_level="warning",
+        proxy_headers=True,    # Important for ElevenLabs/Railway proxy
+        forwarded_allow_ips="*" # Ensures headers like x-api-key pass through
     )
