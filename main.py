@@ -431,7 +431,6 @@ async def chat_completions(req: ChatRequest, request: Request):
                 messages=final_messages,
                 stream=True,
                 max_completion_tokens=req.max_completion_tokens,
-                top_p=0.9,
             )
 
             async for chunk in response:
