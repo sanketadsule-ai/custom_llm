@@ -339,7 +339,7 @@ limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
 http_client = httpx.AsyncClient(
     limits=limits,
     timeout=30.0,
-    http2=True  # ✅ HTTP/2 reduces handshake overhead
+    #http2=True  # ✅ HTTP/2 reduces handshake overhead
 )
 
 client = AsyncAzureOpenAI(
