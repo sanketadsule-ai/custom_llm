@@ -170,9 +170,6 @@ from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
 from cachetools import TTLCache
 
-# -----------------------------
-# 1. High-Performance Setup
-# -----------------------------
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("maya-ultra-low-latency")
 
@@ -189,13 +186,19 @@ client = AsyncAzureOpenAI(
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 RESPONSE_CACHE = TTLCache(maxsize=200, ttl=300)
-FLUSH_CHARS = {".", "!", "?", ","}
+
+# ✅ NEW: Tight system prompt reduces model "thinking" time
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": (
+        "You are Maya, a fast, helpful voice assistant. "
+        "Reply in 1-2 short sentences. No filler. No markdown. "
+        "Be direct and conversational."
+    )
+}
 
 app = FastAPI()
 
-# -----------------------------
-# 2. Models - UPDATED PARAMETER
-# -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     role: str
@@ -204,37 +207,37 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[Message]
     stream: bool = True
-    # CHANGED: max_tokens -> max_completion_tokens
-    max_completion_tokens: int = 150 
+    max_completion_tokens: int = 60  # ✅ REDUCED from 150 → 60
 
-# -----------------------------
-# 3. Connection Pre-Warming - UPDATED PARAMETER
-# -----------------------------
 @app.on_event("startup")
 async def warmup():
     try:
         await client.chat.completions.create(
             model=DEPLOYMENT,
-            messages=[{"role": "user", "content": "hi"}],
-            # CHANGED: max_tokens -> max_completion_tokens
-            max_completion_tokens=10 
+            messages=[
+                SYSTEM_PROMPT,
+                {"role": "user", "content": "hi"}
+            ],
+            max_completion_tokens=5,       # ✅ Minimal warmup
+            temperature=0.7,
         )
         logger.warning("Azure connection pre-warmed successfully.")
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
 
-# -----------------------------
-# 4. Optimized Streaming Endpoint
-# -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        relevant = [m for m in req.messages if m.content][-3:]
-        user_context = "".join(f"{m.role}:{m.content}" for m in relevant)
-        ckey = hashlib.md5(user_context.encode()).hexdigest()
+        # ✅ Cache only on last user message (faster key, better hit rate)
+        last_user_msg = next(
+            (m.content for m in reversed(req.messages)
+             if m.role == "user" and m.content),
+            ""
+        )
+        ckey = hashlib.md5(last_user_msg.encode()).hexdigest()
 
         if ckey in RESPONSE_CACHE:
             cached_val = RESPONSE_CACHE[ckey]
@@ -246,38 +249,36 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         collected = []
         try:
-            final_messages = [
+            # ✅ Only last 4 messages + system prompt (smaller context = faster)
+            recent_messages = [
                 {"role": m.role, "content": m.content}
                 for m in req.messages if m.content
-            ]
+            ][-4:]
 
-            # UPDATED: Use max_completion_tokens in the Azure Call
+            final_messages = [SYSTEM_PROMPT] + recent_messages
+
             response = await client.chat.completions.create(
                 model=DEPLOYMENT,
                 messages=final_messages,
-               
                 stream=True,
                 max_completion_tokens=req.max_completion_tokens,
+                temperature=0.7,    # ✅ Explicit = faster sampling
+                top_p=0.9,          # ✅ Nucleus sampling = fewer candidates
             )
 
             async for chunk in response:
                 if not chunk.choices:
                     continue
-
                 delta = chunk.choices[0].delta
                 if not delta.content:
                     continue
 
                 token = delta.content
                 collected.append(token)
-                
-                minimal_data = {
-                    "choices": [{
-                        "delta": {"content": token},
-                        "index": 0
-                    }]
-                }
-                yield b"data: " + orjson.dumps(minimal_data) + b"\n\n"
+
+                yield b"data: " + orjson.dumps({
+                    "choices": [{"delta": {"content": token}, "index": 0}]
+                }) + b"\n\n"
 
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
