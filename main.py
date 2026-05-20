@@ -157,8 +157,6 @@
 #     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), loop=loop_type)
 
 
-
-
 import os
 import hashlib
 import logging
@@ -175,10 +173,11 @@ from cachetools import TTLCache
 # -----------------------------
 # 1. High-Performance Setup
 # -----------------------------
+# Use WARNING level to keep logs clean and reduce I/O overhead
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("maya-ultra-low-latency")
 
-# Optimized connection pool for Azure
+# Aggressive connection pooling for Azure OpenAI
 limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
 http_client = httpx.AsyncClient(limits=limits, timeout=30.0)
 
@@ -192,14 +191,13 @@ client = AsyncAzureOpenAI(
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 
-# TTLCache: auto-expires stale responses after 5 minutes
+# TTLCache: auto-expires stale responses after 5 minutes to keep memory low
 RESPONSE_CACHE = TTLCache(maxsize=200, ttl=300)
 
 # Sentence boundary characters for voice-optimized flushing
 FLUSH_CHARS = {".", "!", "?", ","}
 
 app = FastAPI()
-
 
 # -----------------------------
 # 2. Models
@@ -209,29 +207,26 @@ class Message(BaseModel):
     role: str
     content: Optional[str] = None
 
-
 class ChatRequest(BaseModel):
     messages: List[Message]
     stream: bool = True
-    max_completion_tokens: int = 80  # Tuned for voice: most spoken answers are 30-80 tokens
-
+    max_tokens: int = 150  # Tuned for natural conversation
 
 # -----------------------------
 # 3. Connection Pre-Warming
 # -----------------------------
 @app.on_event("startup")
 async def warmup():
-    """Pre-establish connection to Azure so the first real request isn't cold."""
+    """Pre-establish TCP/TLS connection to Azure so the first real request is hot."""
     try:
         await client.chat.completions.create(
             model=DEPLOYMENT,
             messages=[{"role": "user", "content": "hi"}],
-            max_completion_tokens=1
+            max_tokens=10 
         )
         logger.warning("Azure connection pre-warmed successfully.")
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
-
 
 # -----------------------------
 # 4. Optimized Streaming Endpoint
@@ -243,25 +238,23 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # Cache key: hash of last full user+assistant exchange for better context sensitivity
-        relevant = [m for m in req.messages if m.content][-4:]
+        # Cache key: hash of last few messages for quick repeat handling
+        relevant = [m for m in req.messages if m.content][-3:]
         user_context = "".join(f"{m.role}:{m.content}" for m in relevant)
         ckey = hashlib.md5(user_context.encode()).hexdigest()
 
-        # Cache hit: stream cached response instantly
         if ckey in RESPONSE_CACHE:
             cached_val = RESPONSE_CACHE[ckey]
+            # Immediately send cached value as a single chunk
             yield b"data: " + orjson.dumps({
-                "choices": [{"delta": {"content": cached_val}}]
+                "choices": [{"delta": {"content": cached_val}, "index": 0}]
             }) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
 
         collected = []
-        sentence_buffer = ""
-
         try:
-            # Build message list directly — avoids model_dump overhead
+            # Build clean message list
             final_messages = [
                 {"role": m.role, "content": m.content}
                 for m in req.messages if m.content
@@ -270,13 +263,13 @@ async def chat_completions(req: ChatRequest, request: Request):
             response = await client.chat.completions.create(
                 model=DEPLOYMENT,
                 messages=final_messages,
-                 # Sounds more natural for voice
+                temperature=0.7,
                 stream=True,
-                max_completion_tokens=req.max_completion_tokens,
+                max_tokens=req.max_tokens,
             )
 
             async for chunk in response:
-                # Skip Azure's empty content-filter chunks
+                # 1. Skip Azure's empty metadata/filter chunks
                 if not chunk.choices:
                     continue
 
@@ -286,25 +279,17 @@ async def chat_completions(req: ChatRequest, request: Request):
 
                 token = delta.content
                 collected.append(token)
-                sentence_buffer += token
+                
+                # 2. Minimal Payload: Only send what ElevenLabs strictly needs
+                minimal_data = {
+                    "choices": [{
+                        "delta": {"content": token},
+                        "index": 0
+                    }]
+                }
+                yield b"data: " + orjson.dumps(minimal_data) + b"\n\n"
 
-                # Voice optimization: flush at sentence boundaries
-                # so the TTS pipeline receives complete phrases sooner
-                if any(p in sentence_buffer for p in FLUSH_CHARS):
-                    yield b"data: " + orjson.dumps(
-                        chunk.model_dump(exclude_none=True)
-                    ) + b"\n\n"
-                    sentence_buffer = ""
-                else:
-                    yield b"data: " + orjson.dumps(
-                        chunk.model_dump(exclude_none=True)
-                    ) + b"\n\n"
-
-            # Flush any remaining buffer content
-            if sentence_buffer and collected:
-                pass  # Already yielded token-by-token above
-
-            # Cache the full response for future hits
+            # 3. Cache the full response in the background
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
 
@@ -318,42 +303,35 @@ async def chat_completions(req: ChatRequest, request: Request):
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "X-Accel-Buffering": "no",   # Critical for Railway/Vercel/Nginx
+            "X-Accel-Buffering": "no",   # Critical for Railway/Nginx
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         }
     )
 
-
-# -----------------------------
-# 5. Health Check
-# -----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "cache_size": len(RESPONSE_CACHE)}
 
-
 # -----------------------------
-# 6. Entry Point
+# 5. Production Entry Point
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    import os
     import sys
 
-    # Railway provides the PORT environment variable. 
-    # We MUST use it, and we MUST bind to 0.0.0.0
+    # Get port from environment or default to 8000
     port = int(os.getenv("PORT", 8000))
     
-    # Use uvloop for maximum networking performance on Linux (Railway)
+    # Use uvloop for highest performance on Linux (Railway)
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
 
     uvicorn.run(
-        "main:app",            # Use the string "file_name:app_variable"
-        host="0.0.0.0",        # Mandatory for Railway
-        port=port,             # Use the dynamic port from Railway
+        "main:app",
+        host="0.0.0.0",
+        port=port,
         loop=loop_type,
         log_level="warning",
-        proxy_headers=True,    # Important for ElevenLabs/Railway proxy
-        forwarded_allow_ips="*" # Ensures headers like x-api-key pass through
+        proxy_headers=True,
+        forwarded_allow_ips="*"
     )
