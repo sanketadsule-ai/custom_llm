@@ -173,11 +173,9 @@ from cachetools import TTLCache
 # -----------------------------
 # 1. High-Performance Setup
 # -----------------------------
-# Use WARNING level to keep logs clean and reduce I/O overhead
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("maya-ultra-low-latency")
 
-# Aggressive connection pooling for Azure OpenAI
 limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
 http_client = httpx.AsyncClient(limits=limits, timeout=30.0)
 
@@ -190,17 +188,13 @@ client = AsyncAzureOpenAI(
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
-
-# TTLCache: auto-expires stale responses after 5 minutes to keep memory low
 RESPONSE_CACHE = TTLCache(maxsize=200, ttl=300)
-
-# Sentence boundary characters for voice-optimized flushing
 FLUSH_CHARS = {".", "!", "?", ","}
 
 app = FastAPI()
 
 # -----------------------------
-# 2. Models
+# 2. Models - UPDATED PARAMETER
 # -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -210,19 +204,20 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[Message]
     stream: bool = True
-    max_tokens: int = 150  # Tuned for natural conversation
+    # CHANGED: max_tokens -> max_completion_tokens
+    max_completion_tokens: int = 150 
 
 # -----------------------------
-# 3. Connection Pre-Warming
+# 3. Connection Pre-Warming - UPDATED PARAMETER
 # -----------------------------
 @app.on_event("startup")
 async def warmup():
-    """Pre-establish TCP/TLS connection to Azure so the first real request is hot."""
     try:
         await client.chat.completions.create(
             model=DEPLOYMENT,
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=10 
+            # CHANGED: max_tokens -> max_completion_tokens
+            max_completion_tokens=10 
         )
         logger.warning("Azure connection pre-warmed successfully.")
     except Exception as e:
@@ -233,19 +228,16 @@ async def warmup():
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
-    # Fast-path auth check
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        # Cache key: hash of last few messages for quick repeat handling
         relevant = [m for m in req.messages if m.content][-3:]
         user_context = "".join(f"{m.role}:{m.content}" for m in relevant)
         ckey = hashlib.md5(user_context.encode()).hexdigest()
 
         if ckey in RESPONSE_CACHE:
             cached_val = RESPONSE_CACHE[ckey]
-            # Immediately send cached value as a single chunk
             yield b"data: " + orjson.dumps({
                 "choices": [{"delta": {"content": cached_val}, "index": 0}]
             }) + b"\n\n"
@@ -254,22 +246,21 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         collected = []
         try:
-            # Build clean message list
             final_messages = [
                 {"role": m.role, "content": m.content}
                 for m in req.messages if m.content
             ]
 
+            # UPDATED: Use max_completion_tokens in the Azure Call
             response = await client.chat.completions.create(
                 model=DEPLOYMENT,
                 messages=final_messages,
                 temperature=0.7,
                 stream=True,
-                max_tokens=req.max_tokens,
+                max_completion_tokens=req.max_completion_tokens,
             )
 
             async for chunk in response:
-                # 1. Skip Azure's empty metadata/filter chunks
                 if not chunk.choices:
                     continue
 
@@ -280,7 +271,6 @@ async def chat_completions(req: ChatRequest, request: Request):
                 token = delta.content
                 collected.append(token)
                 
-                # 2. Minimal Payload: Only send what ElevenLabs strictly needs
                 minimal_data = {
                     "choices": [{
                         "delta": {"content": token},
@@ -289,7 +279,6 @@ async def chat_completions(req: ChatRequest, request: Request):
                 }
                 yield b"data: " + orjson.dumps(minimal_data) + b"\n\n"
 
-            # 3. Cache the full response in the background
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
 
@@ -303,7 +292,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "X-Accel-Buffering": "no",   # Critical for Railway/Nginx
+            "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         }
@@ -313,17 +302,10 @@ async def chat_completions(req: ChatRequest, request: Request):
 async def health():
     return {"status": "ok", "cache_size": len(RESPONSE_CACHE)}
 
-# -----------------------------
-# 5. Production Entry Point
-# -----------------------------
 if __name__ == "__main__":
     import uvicorn
     import sys
-
-    # Get port from environment or default to 8000
     port = int(os.getenv("PORT", 8000))
-    
-    # Use uvloop for highest performance on Linux (Railway)
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
 
     uvicorn.run(
