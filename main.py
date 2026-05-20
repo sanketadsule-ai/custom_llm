@@ -262,7 +262,7 @@ async def chat_completions(req: ChatRequest, request: Request):
                 messages=final_messages,
                 stream=True,
                 max_completion_tokens=req.max_completion_tokens,
-                temperature=0.7,    # ✅ Explicit = faster sampling
+                    # ✅ Explicit = faster sampling
                 top_p=0.9,          # ✅ Nucleus sampling = fewer candidates
             )
 
