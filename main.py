@@ -322,6 +322,7 @@
 import os
 import hashlib
 import logging
+import asyncio
 import orjson
 import httpx
 from typing import List, Optional
@@ -335,26 +336,29 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("maya-ultra-low-latency")
 
 limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
-http_client = httpx.AsyncClient(limits=limits, timeout=30.0)
+http_client = httpx.AsyncClient(
+    limits=limits,
+    timeout=30.0,
+    http2=True  # ✅ HTTP/2 reduces handshake overhead
+)
 
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version="2024-08-01-preview",
+    api_version="2025-04-01-preview",  # ✅ Latest API version for GPT-5
     http_client=http_client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
-RESPONSE_CACHE = TTLCache(maxsize=200, ttl=300)
+RESPONSE_CACHE = TTLCache(maxsize=500, ttl=300)
 
-# Fallback only — used when ElevenLabs sends no system prompt
 FALLBACK_SYSTEM_PROMPT = {
     "role": "system",
     "content": (
-        "You are Maya, a fast, helpful voice assistant. "
-        "Reply in 1-2 short sentences. No filler. No markdown. "
-        "Be direct and conversational."
+        "You are Maya, a voice assistant. "
+        "Reply in 1-2 short sentences only. "
+        "No markdown. No lists. Be direct."
     )
 }
 
@@ -368,10 +372,28 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[Message]
     stream: bool = True
-    max_completion_tokens: int = 60
+    max_completion_tokens: int = 50
+
+# ✅ Background keepalive — pings Azure every 4 mins to avoid cold connections
+async def keepalive_ping():
+    while True:
+        await asyncio.sleep(240)
+        try:
+            await client.chat.completions.create(
+                model=DEPLOYMENT,
+                messages=[
+                    FALLBACK_SYSTEM_PROMPT,
+                    {"role": "user", "content": "hi"}
+                ],
+                max_completion_tokens=3,
+            )
+            logger.warning("Keepalive ping sent.")
+        except Exception as e:
+            logger.warning(f"Keepalive failed: {e}")
 
 @app.on_event("startup")
-async def warmup():
+async def startup():
+    # Initial warmup
     try:
         await client.chat.completions.create(
             model=DEPLOYMENT,
@@ -379,11 +401,14 @@ async def warmup():
                 FALLBACK_SYSTEM_PROMPT,
                 {"role": "user", "content": "hi"}
             ],
-            max_completion_tokens=5,
+            max_completion_tokens=3,
         )
         logger.warning("Azure connection pre-warmed successfully.")
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
+
+    # ✅ Start background keepalive task
+    asyncio.create_task(keepalive_ping())
 
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
@@ -413,18 +438,15 @@ async def chat_completions(req: ChatRequest, request: Request):
                 for m in req.messages if m.content
             ]
 
-            # ✅ Check if ElevenLabs already sent a system prompt
-            has_system_prompt = any(m["role"] == "system" for m in all_messages)
+            has_system = any(m["role"] == "system" for m in all_messages)
+            system_messages = (
+                [m for m in all_messages if m["role"] == "system"]
+                if has_system else [FALLBACK_SYSTEM_PROMPT]
+            )
+            non_system = [m for m in all_messages if m["role"] != "system"]
 
-            if not has_system_prompt:
-                # No system prompt from ElevenLabs — inject fallback
-                final_messages = [FALLBACK_SYSTEM_PROMPT] + all_messages[-4:]
-            else:
-                # ✅ Respect ElevenLabs system prompt — keep it, trim only non-system tail
-                system_messages = [m for m in all_messages if m["role"] == "system"]
-                non_system_messages = [m for m in all_messages if m["role"] != "system"]
-                # Keep system prompt(s) + last 4 conversation turns
-                final_messages = system_messages + non_system_messages[-4:]
+            # ✅ Only last 2 turns — minimize input tokens
+            final_messages = system_messages + non_system[-2:]
 
             response = await client.chat.completions.create(
                 model=DEPLOYMENT,
@@ -432,6 +454,9 @@ async def chat_completions(req: ChatRequest, request: Request):
                 stream=True,
                 max_completion_tokens=req.max_completion_tokens,
             )
+
+            buffer = []
+            buffer_len = 0
 
             async for chunk in response:
                 if not chunk.choices:
@@ -442,9 +467,20 @@ async def chat_completions(req: ChatRequest, request: Request):
 
                 token = delta.content
                 collected.append(token)
+                buffer.append(token)
+                buffer_len += len(token)
 
+                # ✅ Flush every 4 chars or on punctuation
+                if buffer_len >= 4 or (buffer and buffer[-1][-1] in ".!?,"):
+                    yield b"data: " + orjson.dumps({
+                        "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}]
+                    }) + b"\n\n"
+                    buffer = []
+                    buffer_len = 0
+
+            if buffer:
                 yield b"data: " + orjson.dumps({
-                    "choices": [{"delta": {"content": token}, "index": 0}]
+                    "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}]
                 }) + b"\n\n"
 
             if collected:
