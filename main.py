@@ -308,7 +308,6 @@ if __name__ == "__main__":
     import sys
     port = int(os.getenv("PORT", 8000))
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
