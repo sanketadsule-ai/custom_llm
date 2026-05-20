@@ -261,9 +261,9 @@ async def chat_completions(req: ChatRequest, request: Request):
                 model=DEPLOYMENT,
                 messages=final_messages,
                 stream=True,
-                max_completion_tokens=req.max_completion_tokens,
+                max_completion_tokens=req.max_completion_tokens
                     # ✅ Explicit = faster sampling
-                top_p=0.9,          # ✅ Nucleus sampling = fewer candidates
+                         # ✅ Nucleus sampling = fewer candidates
             )
 
             async for chunk in response:
