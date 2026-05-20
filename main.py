@@ -325,163 +325,127 @@ import logging
 import asyncio
 import orjson
 import httpx
-from typing import List, Optional
+from typing import List, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 from openai import AsyncAzureOpenAI
 from fastapi.responses import StreamingResponse
-from cachetools import TTLCache
+from cachetools import LRUCache
 
-logging.basicConfig(level=logging.WARNING)
+# -----------------------------
+# 1. High-Performance Setup
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maya-ultra-low-latency")
 
-limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
-http_client = httpx.AsyncClient(
-    limits=limits,
-    timeout=30.0,
-    #http2=True  # ✅ HTTP/2 reduces handshake overhead
-)
+limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+http_client = httpx.AsyncClient(limits=limits, timeout=60.0)
 
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version="2025-04-01-preview",  # ✅ Latest API version for GPT-5
+    api_version="2024-08-01-preview",
     http_client=http_client
 )
 
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
-RESPONSE_CACHE = TTLCache(maxsize=500, ttl=300)
 
-FALLBACK_SYSTEM_PROMPT = {
-    "role": "system",
-    "content": (
-        "You are Maya, a voice assistant. "
-        "Reply in 1-2 short sentences only. "
-        "No markdown. No lists. Be direct."
-    )
-}
+RESPONSE_CACHE = LRUCache(maxsize=200)
 
 app = FastAPI()
 
+# -----------------------------
+# 2. Optimized Models
+# -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     role: str
     content: Optional[str] = None
+    tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 class ChatRequest(BaseModel):
     messages: List[Message]
+    tools: Optional[List[Any]] = None
     stream: bool = True
-    max_completion_tokens: int = 50
+    max_tokens: int = 100
 
-# ✅ Background keepalive — pings Azure every 4 mins to avoid cold connections
-async def keepalive_ping():
-    while True:
-        await asyncio.sleep(240)
-        try:
-            await client.chat.completions.create(
-                model=DEPLOYMENT,
-                messages=[
-                    FALLBACK_SYSTEM_PROMPT,
-                    {"role": "user", "content": "hi"}
-                ],
-                max_completion_tokens=3,
-            )
-            logger.warning("Keepalive ping sent.")
-        except Exception as e:
-            logger.warning(f"Keepalive failed: {e}")
-
-@app.on_event("startup")
-async def startup():
-    # Initial warmup
-    try:
-        await client.chat.completions.create(
-            model=DEPLOYMENT,
-            messages=[
-                FALLBACK_SYSTEM_PROMPT,
-                {"role": "user", "content": "hi"}
-            ],
-            max_completion_tokens=3,
-        )
-        logger.warning("Azure connection pre-warmed successfully.")
-    except Exception as e:
-        logger.warning(f"Warmup failed (non-fatal): {e}")
-
-    # ✅ Start background keepalive task
-    asyncio.create_task(keepalive_ping())
-
+# -----------------------------
+# 3. Optimized Logic
+# -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
     async def event_generator():
-        last_user_msg = next(
-            (m.content for m in reversed(req.messages)
-             if m.role == "user" and m.content),
-            ""
-        )
-        ckey = hashlib.md5(last_user_msg.encode()).hexdigest()
-
+        user_id = request.headers.get("x-user-id", "anonymous")
+        user_context = "".join([m.content for m in req.messages if m.role == "user"][-10:])
+        ckey = hashlib.md5(f"{user_id}:{user_context}".encode()).hexdigest()
+        
         if ckey in RESPONSE_CACHE:
-            cached_val = RESPONSE_CACHE[ckey]
-            yield b"data: " + orjson.dumps({
-                "choices": [{"delta": {"content": cached_val}, "index": 0}]
-            }) + b"\n\n"
+            yield b"data: " + orjson.dumps({"choices":[{"delta":{"content":RESPONSE_CACHE[ckey]}}]}) + b"\n\n"
             yield b"data: [DONE]\n\n"
             return
 
         collected = []
         try:
-            all_messages = [
-                {"role": m.role, "content": m.content}
-                for m in req.messages if m.content
-            ]
+            # 1. Separate System Message
+            system_msg = next((m for m in req.messages if m.role == "system"), None)
+            
+            # 2. Extract History (Excluding System)
+            history_pool = [m for m in req.messages if m.role != "system"]
+            
+            # 3. Slicing with Tool Integrity
+            # We take the last 10 messages, but check if the first one is a 'tool'
+            slice_index = -10
+            if abs(slice_index) < len(history_pool):
+                # If the first message in our slice is a 'tool', we MUST include the one before it
+                if history_pool[slice_index].role == "tool":
+                    slice_index -= 1 
+            
+            recent_history = history_pool[slice_index:]
+            
+            # 4. Reconstruct final payload
+            final_messages = []
+            if system_msg:
+                final_messages.append(system_msg.model_dump(exclude_none=True))
+            
+            final_messages.extend([m.model_dump(exclude_none=True) for m in recent_history])
 
-            has_system = any(m["role"] == "system" for m in all_messages)
-            system_messages = (
-                [m for m in all_messages if m["role"] == "system"]
-                if has_system else [FALLBACK_SYSTEM_PROMPT]
+            kwargs = {
+                "model": DEPLOYMENT,
+                "messages": final_messages,
+                "temperature": 0.0,
+                "stream": True,
+                "max_tokens": req.max_tokens,
+                "stream_options": {"include_usage": True},
+            }
+            
+            if req.tools:
+                kwargs["tools"] = req.tools
+                kwargs["tool_choice"] = "auto"
+
+            response = await asyncio.wait_for(
+                client.chat.completions.create(**kwargs),
+                timeout=15.0 # Increased slightly for tool-heavy processing
             )
-            non_system = [m for m in all_messages if m["role"] != "system"]
 
-            # ✅ Only last 2 turns — minimize input tokens
-            final_messages = system_messages + non_system[-2:]
-
-            response = await client.chat.completions.create(
-                model=DEPLOYMENT,
-                messages=final_messages,
-                stream=True,
-                max_completion_tokens=req.max_completion_tokens,
-            )
-
-            buffer = []
-            buffer_len = 0
-
+            first_chunk = True
             async for chunk in response:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if not delta.content:
-                    continue
+                chunk_data = chunk.model_dump(exclude_none=True)
+                yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
 
-                token = delta.content
-                collected.append(token)
-                buffer.append(token)
-                buffer_len += len(token)
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        collected.append(delta.content)
 
-                # ✅ Flush every 4 chars or on punctuation
-                if buffer_len >= 4 or (buffer and buffer[-1][-1] in ".!?,"):
-                    yield b"data: " + orjson.dumps({
-                        "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}]
-                    }) + b"\n\n"
-                    buffer = []
-                    buffer_len = 0
-
-            if buffer:
-                yield b"data: " + orjson.dumps({
-                    "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}]
-                }) + b"\n\n"
+                if first_chunk:
+                    first_chunk = False
+                    await asyncio.sleep(0) 
 
             if collected:
                 RESPONSE_CACHE[ckey] = "".join(collected)
@@ -489,34 +453,26 @@ async def chat_completions(req: ChatRequest, request: Request):
             yield b"data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"Streaming error: {e}")
+            logger.error(f"Streaming Error: {e}")
+            # Ensure the stream closes cleanly on error
             yield b"data: [DONE]\n\n"
 
     return StreamingResponse(
-        event_generator(),
+        event_generator(), 
         media_type="text/event-stream",
         headers={
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "keep-alive"
         }
     )
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "cache_size": len(RESPONSE_CACHE)}
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
 
 if __name__ == "__main__":
     import uvicorn
     import sys
-    port = int(os.getenv("PORT", 8000))
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        loop=loop_type,
-        log_level="warning",
-        proxy_headers=True,
-        forwarded_allow_ips="*"
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), loop=loop_type)
