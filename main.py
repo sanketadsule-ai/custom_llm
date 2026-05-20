@@ -219,7 +219,7 @@ async def warmup():
                 {"role": "user", "content": "hi"}
             ],
             max_completion_tokens=5,       # ✅ Minimal warmup
-            temperature=0.7,
+           
         )
         logger.warning("Azure connection pre-warmed successfully.")
     except Exception as e:
