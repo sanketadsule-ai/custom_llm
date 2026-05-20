@@ -5,4 +5,5 @@ orjson==3.10.*
 openai>=1.50.0
 uvloop==0.21.0; sys_platform != 'win32'  # <--- Essential for the Docker build
 httptools==0.6.4
+httpx[http2]
 cachetools==5.5.0
